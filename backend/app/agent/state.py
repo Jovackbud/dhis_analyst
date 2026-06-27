@@ -47,3 +47,4 @@ class AgentState(TypedDict):
     active_chart_configs: list[dict]
     active_slide_manifest: list[dict]
     generated_file_id: Optional[str]
+    active_conversational_response: Optional[str]

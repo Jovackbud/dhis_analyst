@@ -70,15 +70,22 @@ async def build_initial_state(
     request: ChatRequest,
     settings: Settings,
     identity: Identity,
+    history: list[dict] | None = None,
 ) -> AgentState:
     """Classify intent (LLM-assisted when real provider is configured)."""
     intent = await classify_intent_llm(
         request.message,
         settings,
         forced_mode=request.output_mode,
+        history=history,
     )
+    messages = []
+    if history:
+        messages.extend(history)
+    messages.append({"role": "user", "content": request.message})
+
     return {
-        "messages": [{"role": "user", "content": request.message}],
+        "messages": messages,
         "session_id": request.session_id or str(uuid.uuid4()),
         "user_id": identity.user_id,
         "user_role": identity.role,
@@ -100,6 +107,7 @@ async def build_initial_state(
         "active_chart_configs": [],
         "active_slide_manifest": [],
         "generated_file_id": None,
+        "active_conversational_response": None,
     }
 
 
@@ -107,6 +115,7 @@ async def run_agent_stream(
     request: ChatRequest,
     settings: Settings,
     identity: Identity | None = None,
+    history: list[dict] | None = None,
 ) -> AsyncIterator[str]:
     """Main agent pipeline — yields SSE-formatted strings."""
     if identity is None:
@@ -124,7 +133,7 @@ async def run_agent_stream(
     pipeline_start = time.monotonic()
 
     try:
-        state = await build_initial_state(request, settings, identity)
+        state = await build_initial_state(request, settings, identity, history)
     except Exception as exc:
         logger.error("intent_classification_failed", extra={"error": str(exc)})
         yield sse("error", {"code": "INTENT_FAILED", "user_message": "Could not understand your request. Please try rephrasing.", "detail": str(exc)})
@@ -233,7 +242,7 @@ async def run_agent_stream(
         })
     else:
         # Conversational — stream token by token
-        answer = render_answer(state)
+        answer = state.get("active_conversational_response") or render_answer(state)
         for chunk in _chunk(answer, 64):
             yield sse("token", {"text": chunk})
             await asyncio.sleep(0)

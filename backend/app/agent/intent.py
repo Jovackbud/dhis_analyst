@@ -199,6 +199,7 @@ async def classify_intent_llm(
     settings,
     forced_mode: OutputMode | None = None,
     today: date | None = None,
+    history: list[dict[str, str]] | None = None,
 ) -> dict[str, Any]:
     """LLM-assisted intent classifier. Falls back to deterministic classifier
     if LLM call fails or provider is not real."""
@@ -214,8 +215,14 @@ async def classify_intent_llm(
     system = f"""You are an intent classifier for a DHIS2 public health analytics system.
 Today is {now.isoformat()}. Analyse the user query and return ONLY a JSON object.
 
+CRITICAL: You are provided with the conversation history (if any) before the user query.
+Use the conversation history to understand follow-up questions, omissions, and context changes.
+For example, if the user previously asked for 'malaria confirmed cases in Lagos in 2024' and now asks 'What about 2025?', you must carry over the metric ('Malaria Confirmed Cases' with its UID) and the organization unit ('Lagos' with its level/UID), but update the periods to ['2025'].
+Similarly, if they ask 'What about Oyo state?', carry over the metric and periods but update the organization unit to 'Oyo State'.
+If a query is general, conversational, or a direct follow-up explaining or discussing the data (e.g. 'explain this trend', 'why did this decrease?'), select 'conversational' as the output_mode and carry over the relevant metrics, periods, and organization unit context from the history.
+
 Available output modes:
-- conversational: general Q&A, analysis, explanations
+- conversational: general Q&A, analysis, explanations, follow-up comments on data
 - dashboard: charts, trend visualisations, comparisons
 - report: formal briefings, programme reviews, monthly reports
 - presentation: slide decks, briefing decks
@@ -253,9 +260,18 @@ Always prefer DHIS2 relative period codes over computing individual month/quarte
 Web enrichment: true for WHO guidelines, benchmarks, outbreak context, policy, external comparisons.
 """
 
+    llm_messages = [{"role": "system", "content": system}]
+    if history:
+        for msg in history:
+            llm_messages.append({
+                "role": msg["role"],
+                "content": msg["content"]
+            })
+    llm_messages.append({"role": "user", "content": message})
+
     try:
         raw = await complete(
-            [{"role": "system", "content": system}, {"role": "user", "content": message}],
+            llm_messages,
             settings,
             json_mode=True,
             temperature=0.1,

@@ -259,6 +259,7 @@ async def chat(
     request: ChatRequest,
     settings: Settings = Depends(get_settings),
     identity: Identity = Depends(current_identity),
+    session=Depends(get_session),
 ):
     logger.info(
         "chat_request",
@@ -270,8 +271,30 @@ async def chat(
             "allow_web": request.allow_web,
         },
     )
+    
+    history = []
+    if request.conversation_id:
+        try:
+            history = await conv_db.get_messages(session, request.conversation_id, identity.user_id)
+        except Exception as exc:
+            logger.warning("failed_to_load_chat_history", extra={"error": str(exc)})
+
+    previous_messages = []
+    if history:
+        if history[-1]["role"] == "user":
+            previous_messages = history[:-1]
+        else:
+            previous_messages = history
+
+    formatted_history = []
+    for msg in previous_messages[-8:]:
+        formatted_history.append({
+            "role": msg["role"],
+            "content": msg["content"]
+        })
+
     return StreamingResponse(
-        run_agent_stream(request, settings, identity),
+        run_agent_stream(request, settings, identity, formatted_history),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
