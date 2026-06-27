@@ -1,0 +1,42 @@
+# Version control
+.git/
+.gitignore
+
+# Virtual environments
+.venv/
+venv/
+
+# Node modules (not needed in container)
+node_modules/
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# IDE
+.vscode/
+.idea/
+
+# Environment & secrets
+.env
+.env.local
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker (avoid recursive context)
+docker-compose.yml
+Dockerfile
+
+# Documentation
+*.md
+dhis2-ai-analyst-spec.md

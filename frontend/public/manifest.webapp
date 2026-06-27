@@ -1,0 +1,17 @@
+{
+  "version": "1.0.0",
+  "name": "DHIS2 AI Analyst",
+  "description": "Conversational public health intelligence assistant for DHIS2.",
+  "launch_path": "index.html",
+  "icons": {
+    "48": "icon-48.png"
+  },
+  "developer": {
+    "name": "DHIS2 AI Analyst"
+  },
+  "activities": {
+    "dhis": {
+      "href": "*"
+    }
+  }
+}

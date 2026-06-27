@@ -1,0 +1,131 @@
+"""DHIS2 data retrieval node.
+
+Handles three strategies:
+- analytics_api (default): DHIS2 Analytics API via DHIS2Client
+- direct_sql (gated by ENABLE_DIRECT_SQL=true): validated read-only SQL
+- both: merge results from analytics_api and direct_sql
+
+Falls back to deterministic mock data when no DHIS2 credentials are configured.
+"""
+from __future__ import annotations
+
+import logging
+
+from backend.config import Settings
+from backend.app.agent.state import AgentState
+from backend.app.dhis2.analytics import build_analytics_params, normalise_analytics_response
+from backend.app.dhis2.client import DHIS2Client
+
+logger = logging.getLogger("dhis2_analyst.fetch_dhis2")
+
+
+async def fetch_dhis2(state: AgentState, settings: Settings | None = None) -> AgentState:
+    strategy = state.get("data_retrieval_strategy", "analytics_api")
+
+    has_credentials = bool(
+        settings and (
+            settings.dhis2_service_account_user
+            or state.get("_dhis2_token")
+        )
+    )
+
+    logger.info(
+        "dhis2_fetch_start",
+        extra={
+            "strategy": strategy,
+            "has_credentials": has_credentials,
+            "session_id": state.get("session_id"),
+            "org_unit": state.get("org_unit"),
+            "periods": state.get("periods"),
+        }
+    )
+
+    if not has_credentials:
+        logger.info("dhis2_mock_mode — no credentials configured")
+        state["dhis2_data"] = _mock_data(state)
+        return state
+
+    client = DHIS2Client(settings, token=state.get("_dhis2_token"))
+
+    if strategy == "analytics_api":
+        state["dhis2_data"] = await _fetch_analytics(state, client)
+    elif strategy == "direct_sql" and settings and settings.enable_direct_sql:
+        state["dhis2_data"] = await _fetch_sql(state, settings)
+    elif strategy == "both" and settings and settings.enable_direct_sql:
+        api_data = await _fetch_analytics(state, client)
+        sql_data = await _fetch_sql(state, settings)
+        state["dhis2_data"] = _merge(api_data, sql_data)
+    else:
+        state["dhis2_data"] = await _fetch_analytics(state, client)
+
+    logger.info(
+        "dhis2_fetch_ok",
+        extra={
+            "strategy": strategy,
+            "row_count": len(state["dhis2_data"].get("rows", [])),
+            "session_id": state["session_id"],
+        },
+    )
+    return state
+
+
+async def _fetch_analytics(state: AgentState, client: DHIS2Client) -> dict:
+    params = build_analytics_params(state)
+    raw = await client.analytics(params)
+    return normalise_analytics_response(raw, params)
+
+
+async def _fetch_sql(state: AgentState, settings: Settings) -> dict:
+    from backend.app.agent.nodes.fetch_sql import build_analytics_sql, execute_validated_sql
+    from backend.app.db.session import get_db_session
+
+    sql = build_analytics_sql(state)
+    async with get_db_session() as session:
+        rows, headers = await execute_validated_sql(sql, session, settings.sql_timeout_seconds)
+
+    return {
+        "rows": rows,
+        "headers": headers,
+        "metadata": {
+            "data_source": "direct_sql",
+            "indicators": state["metrics"],
+            "org_units": [state["org_unit"]],
+            "periods": state["periods"],
+        },
+    }
+
+
+def _merge(api_data: dict, sql_data: dict) -> dict:
+    """Merge rows from both sources, preferring API data. Deduplicates by first 3 columns."""
+    api_rows = api_data.get("rows", [])
+    sql_rows = sql_data.get("rows", [])
+    seen = {tuple(r[:3]) for r in api_rows}
+    extra = [r for r in sql_rows if tuple(r[:3]) not in seen]
+    return {
+        **api_data,
+        "rows": api_rows + extra,
+        "metadata": {**api_data.get("metadata", {}), "data_source": "both", "sql_extra_rows": len(extra)},
+    }
+
+
+def _mock_data(state: AgentState) -> dict:
+    """Deterministic mock — used when no DHIS2 credentials are present."""
+    metric = state["metrics"][0]["label"] if state["metrics"] else "Indicator"
+    org = state["org_unit"]["label"]
+    rows = []
+    base_value = 1200
+    for idx, period in enumerate(state["periods"]):
+        # Simulate slight trend variation
+        value = base_value + (idx * 113) - (idx * idx * 7)
+        rows.append([org, period, max(0, value), metric])
+
+    return {
+        "rows": rows,
+        "headers": ["Organisation unit", "Period", "Value", "Metric"],
+        "metadata": {
+            "indicators": state["metrics"],
+            "org_units": [state["org_unit"]],
+            "periods": state["periods"],
+            "data_source": "mock_analytics_api",
+        },
+    }

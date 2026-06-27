@@ -1,0 +1,268 @@
+"""LangGraph state machine — streaming agent pipeline.
+
+Architecture:
+  classify_intent → resolve_metadata → fetch_dhis2 → enrich_web →
+  evidence_fusion → generate_content → route_to_renderer → SSE stream
+
+The chat endpoint calls run_agent_stream() which yields typed SSE events.
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import time
+import uuid
+from collections.abc import AsyncIterator
+from typing import Any, Awaitable, Callable
+
+from backend.config import Settings
+from backend.app.agent.intent import classify_intent, classify_intent_llm
+from backend.app.agent.nodes.enrich_web import enrich_web
+from backend.app.agent.nodes.evidence_fusion import fuse_evidence
+from backend.app.agent.nodes.fetch_dhis2 import fetch_dhis2
+from backend.app.agent.nodes.generate_content import generate_content
+from backend.app.agent.nodes.metadata_resolve import resolve_metadata
+from backend.app.agent.renderers.conversational import render_answer
+from backend.app.agent.renderers.export import render_export_payload
+from backend.app.agent.state import AgentState
+from backend.app.models import ChatRequest, Identity
+
+logger = logging.getLogger("dhis2_analyst.graph")
+
+
+def sse(event: str, payload: dict | list | str | None = None) -> str:
+    body = json.dumps(_json_ready(payload if payload is not None else {}), ensure_ascii=False)
+    return f"event: {event}\ndata: {body}\n\n"
+
+
+def _json_ready(value: Any) -> Any:
+    if hasattr(value, "model_dump"):
+        return value.model_dump()
+    if isinstance(value, dict):
+        return {str(k): _json_ready(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_json_ready(v) for v in value]
+    return value
+
+
+async def _timed_node(
+    name: str,
+    fn: Callable[[AgentState, Settings], Awaitable[AgentState]],
+    state: AgentState,
+    settings: Settings,
+) -> AgentState:
+    start = time.monotonic()
+    try:
+        return await fn(state, settings)
+    finally:
+        logger.info(
+            "agent_node_timing",
+            extra={
+                "node": name,
+                "session_id": state.get("session_id"),
+                "duration_ms": int((time.monotonic() - start) * 1000),
+            },
+        )
+
+
+async def build_initial_state(
+    request: ChatRequest,
+    settings: Settings,
+    identity: Identity,
+) -> AgentState:
+    """Classify intent (LLM-assisted when real provider is configured)."""
+    intent = await classify_intent_llm(
+        request.message,
+        settings,
+        forced_mode=request.output_mode,
+    )
+    return {
+        "messages": [{"role": "user", "content": request.message}],
+        "session_id": request.session_id or str(uuid.uuid4()),
+        "user_id": identity.user_id,
+        "user_role": identity.role,
+        "output_mode": intent["output_mode"],
+        "metrics": intent["metrics"],
+        "org_unit": intent["org_unit"],
+        "periods": intent["periods"],
+        "disaggregations": intent["disaggregations"],
+        "viz_types": intent["viz_types"],
+        "needs_web_enrichment": bool(intent["needs_web_enrichment"] and request.allow_web),
+        "web_search_queries": intent["web_search_queries"],
+        "data_retrieval_strategy": intent["data_retrieval_strategy"],
+        "clarification_needed": intent["clarification_needed"],
+        "clarification_question": intent["clarification_question"],
+        "dhis2_data": {},
+        "web_context": [],
+        "evidence_items": [],
+        "active_report_html": "",
+        "active_chart_configs": [],
+        "active_slide_manifest": [],
+        "generated_file_id": None,
+    }
+
+
+async def run_agent_stream(
+    request: ChatRequest,
+    settings: Settings,
+    identity: Identity | None = None,
+) -> AsyncIterator[str]:
+    """Main agent pipeline — yields SSE-formatted strings."""
+    if identity is None:
+        from backend.app.models import Identity as _Identity
+        identity = _Identity(user_id="anonymous")
+
+    logger.info(
+        "agent_start",
+        extra={
+            "session_id": request.session_id,
+            "user_id": identity.user_id,
+            "message_len": len(request.message),
+        },
+    )
+    pipeline_start = time.monotonic()
+
+    try:
+        state = await build_initial_state(request, settings, identity)
+    except Exception as exc:
+        logger.error("intent_classification_failed", extra={"error": str(exc)})
+        yield sse("error", {"code": "INTENT_FAILED", "user_message": "Could not understand your request. Please try rephrasing.", "detail": str(exc)})
+        yield sse("done")
+        return
+
+    # --- Clarification gate ---
+    if state["clarification_needed"]:
+        yield sse("clarification", {"question": state["clarification_question"]})
+        yield sse("done")
+        return
+
+    # --- Metadata resolution ---
+    try:
+        state = await _timed_node("resolve_metadata", resolve_metadata, state, settings)
+    except Exception as exc:
+        logger.error("metadata_resolve_failed", extra={"error": str(exc)})
+        yield sse("error", {"code": "METADATA_FAILED", "user_message": "Could not resolve indicator metadata.", "detail": str(exc)})
+        yield sse("done")
+        return
+
+    if state["clarification_needed"]:
+        yield sse("clarification", {"question": state["clarification_question"]})
+        yield sse("done")
+        return
+
+    # --- Data retrieval ---
+    try:
+        state = await _timed_node("fetch_dhis2", fetch_dhis2, state, settings)
+    except Exception as exc:
+        error_msg = str(exc)
+        is_period_error = "409" in error_msg and "period" in error_msg.lower()
+
+        if is_period_error:
+            # Retry with a safe fallback period
+            logger.warning(
+                "fetch_dhis2_period_retry",
+                extra={
+                    "original_periods": state.get("periods"),
+                    "fallback_period": "THIS_YEAR",
+                },
+            )
+            state["periods"] = ["THIS_YEAR"]
+            try:
+                state = await _timed_node("fetch_dhis2_retry", fetch_dhis2, state, settings)
+            except Exception as retry_exc:
+                logger.error("fetch_dhis2_retry_failed", extra={"error": str(retry_exc)})
+                yield sse("error", {
+                    "code": "DATA_FETCH_FAILED",
+                    "user_message": "Could not retrieve DHIS2 data even with fallback period. The server may be unavailable.",
+                    "detail": str(retry_exc),
+                })
+                # Non-fatal — continue with empty data
+        else:
+            logger.error("fetch_dhis2_failed", extra={"error": error_msg})
+            yield sse("error", {
+                "code": "DATA_FETCH_FAILED",
+                "user_message": f"Could not retrieve DHIS2 data: {_user_friendly_error(error_msg)}",
+                "detail": error_msg,
+            })
+            # Non-fatal — continue with empty data
+
+    # --- Web enrichment ---
+    try:
+        state = await _timed_node("enrich_web", enrich_web, state, settings)
+    except Exception as exc:
+        logger.warning("web_enrichment_failed", extra={"error": str(exc)})
+        state["web_context"] = []  # Non-fatal
+
+    # --- Evidence fusion ---
+    try:
+        state = await _timed_node("fuse_evidence", fuse_evidence, state, settings)
+    except Exception as exc:
+        logger.warning("evidence_fusion_failed", extra={"error": str(exc)})
+        state["evidence_items"] = []
+
+    if state["evidence_items"]:
+        yield sse("evidence", state["evidence_items"])
+
+    # --- Content generation + routing ---
+    try:
+        state = await _timed_node("generate_content", generate_content, state, settings)
+    except Exception as exc:
+        logger.error("content_generation_failed", extra={"error": str(exc)})
+        yield sse("error", {"code": "CONTENT_FAILED", "user_message": "Content generation failed.", "detail": str(exc)})
+        yield sse("done")
+        return
+
+    mode = state["output_mode"]
+
+    if mode == "dashboard":
+        for chart in state["active_chart_configs"]:
+            yield sse("chart_config", chart)
+            await asyncio.sleep(0)
+    elif mode == "report":
+        yield sse("report_html", {"html": state["active_report_html"]})
+    elif mode == "presentation":
+        yield sse("slide_manifest", state["active_slide_manifest"])
+    elif mode == "export":
+        payload = render_export_payload(state)
+        yield sse("data_ready", {
+            "file_id": None,
+            "format": "json",
+            "row_count": len(payload.get("rows", [])),
+            "data": payload,
+        })
+    else:
+        # Conversational — stream token by token
+        answer = render_answer(state)
+        for chunk in _chunk(answer, 64):
+            yield sse("token", {"text": chunk})
+            await asyncio.sleep(0)
+
+    logger.info(
+        "agent_done",
+        extra={
+            "session_id": state["session_id"],
+            "mode": mode,
+            "duration_ms": int((time.monotonic() - pipeline_start) * 1000),
+        },
+    )
+    yield sse("done")
+
+
+def _chunk(text: str, size: int) -> list[str]:
+    return [text[i: i + size] for i in range(0, len(text), size)]
+
+
+def _user_friendly_error(error_msg: str) -> str:
+    """Extract a user-friendly message from a DHIS2 error."""
+    if "409" in error_msg and "period" in error_msg.lower():
+        return "The requested time period was not recognized by DHIS2."
+    if "404" in error_msg:
+        return "The requested resource was not found on the DHIS2 server."
+    if "401" in error_msg or "403" in error_msg:
+        return "Authentication failed — check DHIS2 credentials."
+    if "500" in error_msg:
+        return "The DHIS2 server encountered an internal error."
+    if "ConnectError" in error_msg or "timeout" in error_msg.lower():
+        return "Could not connect to the DHIS2 server."
+    return "An unexpected error occurred while fetching data."
