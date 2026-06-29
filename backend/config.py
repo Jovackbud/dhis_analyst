@@ -21,8 +21,7 @@ class Settings(SettingsBase):
     dhis2_service_account_user: str = ""
     dhis2_service_account_pass: str = ""
 
-    # LLM — provider-agnostic via LiteLLM
-    llm_provider: str = "mock"          # mock | openai | anthropic | ollama | azure | cohere
+    llm_provider: str        # openai | anthropic | ollama | azure | cohere | gemini
     llm_model: str = "gpt-4o"           # model string passed to LiteLLM
     llm_api_key: str = ""
     llm_base_url: str = ""              # for Ollama: http://localhost:11434
@@ -88,14 +87,18 @@ class Settings(SettingsBase):
     def is_postgres(self) -> bool:
         return "postgresql" in self.database_url or "postgres" in self.database_url
 
-    @property
-    def use_real_llm(self) -> bool:
-        """True when a real LLM is configured (not mock)."""
-        return self.llm_provider != "mock" and bool(self.llm_api_key or self.llm_base_url)
+
 
     def startup_checks(self) -> None:
-        """Hard-fail on insecure configuration in production."""
-        if self.jwt_secret == "change-me-in-production" and self.llm_provider != "mock":
+        """Hard-fail on insecure or incomplete configuration."""
+        if not self.llm_api_key and not self.llm_base_url:
+            logger.critical(
+                "FATAL: No LLM credentials configured. "
+                "Set LLM_API_KEY or LLM_BASE_URL (for Ollama) in .env."
+            )
+            sys.exit(1)
+
+        if self.jwt_secret == "change-me-in-production":
             logger.critical(
                 "FATAL: JWT_SECRET is still the default value. "
                 "Set a strong, unique JWT_SECRET in .env before deploying."

@@ -63,7 +63,11 @@ async def test_classify_intent_llm_passes_history():
 
 @pytest.mark.asyncio
 async def test_build_initial_state_contains_history():
-    settings = Settings(llm_provider="mock", embedding_provider="mock")
+    settings = Settings(
+        llm_provider="openai",
+        llm_api_key="fake-key",
+        embedding_provider="mock",
+    )
     request = ChatRequest(message="What about Oyo?", conversation_id="conv123")
     identity = Identity(user_id="user1", role="external_stakeholder")
     history = [
@@ -71,7 +75,20 @@ async def test_build_initial_state_contains_history():
         {"role": "assistant", "content": "Here is malaria in Lagos."}
     ]
     
-    state = await build_initial_state(request, settings, identity, history=history)
+    mock_response = """{
+        "output_mode": "conversational",
+        "metrics": [{"label": "Malaria Confirmed Cases", "uid": "fbfJHSPpUQD"}],
+        "org_unit_label": "Oyo",
+        "periods": ["2025"],
+        "needs_web_enrichment": false,
+        "web_search_queries": [],
+        "clarification_needed": false,
+        "clarification_question": null
+    }"""
+    
+    with patch("backend.app.llm.complete", new_callable=AsyncMock) as mock_complete:
+        mock_complete.return_value = mock_response
+        state = await build_initial_state(request, settings, identity, history=history)
     
     # State messages should contain history + current query
     assert len(state["messages"]) == 3

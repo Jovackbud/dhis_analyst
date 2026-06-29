@@ -38,6 +38,7 @@ class AgentState(TypedDict):
     data_retrieval_strategy: Literal["analytics_api", "direct_sql", "both"]
     clarification_needed: bool
     clarification_question: Optional[str]
+    requires_data: bool
 
     dhis2_data: dict
     web_context: list[dict]

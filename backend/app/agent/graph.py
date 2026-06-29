@@ -17,13 +17,13 @@ from collections.abc import AsyncIterator
 from typing import Any, Awaitable, Callable
 
 from backend.config import Settings
-from backend.app.agent.intent import classify_intent, classify_intent_llm
+from backend.app.agent.intent import classify_intent_llm
 from backend.app.agent.nodes.enrich_web import enrich_web
 from backend.app.agent.nodes.evidence_fusion import fuse_evidence
 from backend.app.agent.nodes.fetch_dhis2 import fetch_dhis2
 from backend.app.agent.nodes.generate_content import generate_content
 from backend.app.agent.nodes.metadata_resolve import resolve_metadata
-from backend.app.agent.renderers.conversational import render_answer
+
 from backend.app.agent.renderers.export import render_export_payload
 from backend.app.agent.state import AgentState
 from backend.app.models import ChatRequest, Identity
@@ -100,6 +100,7 @@ async def build_initial_state(
         "data_retrieval_strategy": intent["data_retrieval_strategy"],
         "clarification_needed": intent["clarification_needed"],
         "clarification_question": intent["clarification_question"],
+        "requires_data": intent.get("requires_data", True),
         "dhis2_data": {},
         "web_context": [],
         "evidence_items": [],
@@ -146,72 +147,76 @@ async def run_agent_stream(
         yield sse("done")
         return
 
-    # --- Metadata resolution ---
-    try:
-        state = await _timed_node("resolve_metadata", resolve_metadata, state, settings)
-    except Exception as exc:
-        logger.error("metadata_resolve_failed", extra={"error": str(exc)})
-        yield sse("error", {"code": "METADATA_FAILED", "user_message": "Could not resolve indicator metadata.", "detail": str(exc)})
-        yield sse("done")
-        return
+    # --- Data pipeline (skipped for casual chitchat) ---
+    if state["requires_data"]:
+        # --- Metadata resolution ---
+        try:
+            state = await _timed_node("resolve_metadata", resolve_metadata, state, settings)
+        except Exception as exc:
+            logger.error("metadata_resolve_failed", extra={"error": str(exc)})
+            yield sse("error", {"code": "METADATA_FAILED", "user_message": "Could not resolve indicator metadata.", "detail": str(exc)})
+            yield sse("done")
+            return
 
-    if state["clarification_needed"]:
-        yield sse("clarification", {"question": state["clarification_question"]})
-        yield sse("done")
-        return
+        if state["clarification_needed"]:
+            yield sse("clarification", {"question": state["clarification_question"]})
+            yield sse("done")
+            return
 
-    # --- Data retrieval ---
-    try:
-        state = await _timed_node("fetch_dhis2", fetch_dhis2, state, settings)
-    except Exception as exc:
-        error_msg = str(exc)
-        is_period_error = "409" in error_msg and "period" in error_msg.lower()
+        # --- Data retrieval ---
+        try:
+            state = await _timed_node("fetch_dhis2", fetch_dhis2, state, settings)
+        except Exception as exc:
+            error_msg = str(exc)
+            is_period_error = "409" in error_msg and "period" in error_msg.lower()
 
-        if is_period_error:
-            # Retry with a safe fallback period
-            logger.warning(
-                "fetch_dhis2_period_retry",
-                extra={
-                    "original_periods": state.get("periods"),
-                    "fallback_period": "THIS_YEAR",
-                },
-            )
-            state["periods"] = ["THIS_YEAR"]
-            try:
-                state = await _timed_node("fetch_dhis2_retry", fetch_dhis2, state, settings)
-            except Exception as retry_exc:
-                logger.error("fetch_dhis2_retry_failed", extra={"error": str(retry_exc)})
+            if is_period_error:
+                # Retry with a safe fallback period
+                logger.warning(
+                    "fetch_dhis2_period_retry",
+                    extra={
+                        "original_periods": state.get("periods"),
+                        "fallback_period": "THIS_YEAR",
+                    },
+                )
+                state["periods"] = ["THIS_YEAR"]
+                try:
+                    state = await _timed_node("fetch_dhis2_retry", fetch_dhis2, state, settings)
+                except Exception as retry_exc:
+                    logger.error("fetch_dhis2_retry_failed", extra={"error": str(retry_exc)})
+                    yield sse("error", {
+                        "code": "DATA_FETCH_FAILED",
+                        "user_message": "Could not retrieve DHIS2 data even with fallback period. The server may be unavailable.",
+                        "detail": str(retry_exc),
+                    })
+                    # Non-fatal — continue with empty data
+            else:
+                logger.error("fetch_dhis2_failed", extra={"error": error_msg})
                 yield sse("error", {
                     "code": "DATA_FETCH_FAILED",
-                    "user_message": "Could not retrieve DHIS2 data even with fallback period. The server may be unavailable.",
-                    "detail": str(retry_exc),
+                    "user_message": f"Could not retrieve DHIS2 data: {_user_friendly_error(error_msg)}",
+                    "detail": error_msg,
                 })
                 # Non-fatal — continue with empty data
-        else:
-            logger.error("fetch_dhis2_failed", extra={"error": error_msg})
-            yield sse("error", {
-                "code": "DATA_FETCH_FAILED",
-                "user_message": f"Could not retrieve DHIS2 data: {_user_friendly_error(error_msg)}",
-                "detail": error_msg,
-            })
-            # Non-fatal — continue with empty data
 
-    # --- Web enrichment ---
-    try:
-        state = await _timed_node("enrich_web", enrich_web, state, settings)
-    except Exception as exc:
-        logger.warning("web_enrichment_failed", extra={"error": str(exc)})
-        state["web_context"] = []  # Non-fatal
+        # --- Web enrichment ---
+        try:
+            state = await _timed_node("enrich_web", enrich_web, state, settings)
+        except Exception as exc:
+            logger.warning("web_enrichment_failed", extra={"error": str(exc)})
+            state["web_context"] = []  # Non-fatal
 
-    # --- Evidence fusion ---
-    try:
-        state = await _timed_node("fuse_evidence", fuse_evidence, state, settings)
-    except Exception as exc:
-        logger.warning("evidence_fusion_failed", extra={"error": str(exc)})
-        state["evidence_items"] = []
+        # --- Evidence fusion ---
+        try:
+            state = await _timed_node("fuse_evidence", fuse_evidence, state, settings)
+        except Exception as exc:
+            logger.warning("evidence_fusion_failed", extra={"error": str(exc)})
+            state["evidence_items"] = []
 
-    if state["evidence_items"]:
-        yield sse("evidence", state["evidence_items"])
+        if state["evidence_items"]:
+            yield sse("evidence", state["evidence_items"])
+    else:
+        logger.info("skipping_data_pipeline", extra={"reason": "requires_data=False", "session_id": state.get("session_id")})
 
     # --- Content generation + routing ---
     try:
@@ -242,7 +247,7 @@ async def run_agent_stream(
         })
     else:
         # Conversational — stream token by token
-        answer = state.get("active_conversational_response") or render_answer(state)
+        answer = state.get("active_conversational_response") or ""
         for chunk in _chunk(answer, 64):
             yield sse("token", {"text": chunk})
             await asyncio.sleep(0)

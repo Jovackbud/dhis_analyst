@@ -11,6 +11,10 @@
 import { render } from 'preact';
 import { useState, useEffect, useCallback, useRef } from 'preact/hooks';
 import '../styles.css';
+import { marked } from 'marked';
+
+// Configure marked for GFM and line breaks
+marked.use({ gfm: true, breaks: true });
 
 import { getAuth, isAuthenticated, clearAuth } from './auth/standaloneAuth.js';
 import { detectDhis2 } from './auth/dhis2Auth.js';
@@ -490,6 +494,8 @@ function MessageBlock({ msg, isLast, isLoading }) {
   const hasCharts = art?.charts?.length > 0;
   const hasReport = !!art?.reportHtml;
   const hasEvidence = art?.evidence?.length > 0;
+  const hasSlides = art?.slides?.length > 0;
+  const hasExport = !!art?.exportData;
   const [sourcesOpen, setSourcesOpen] = useState(false);
 
   return (
@@ -498,7 +504,9 @@ function MessageBlock({ msg, isLast, isLoading }) {
       {isUser && <span class="message-label">You</span>}
 
       <div class="message-bubble">
-        {msg.content || (isLoading ? (
+        {msg.content ? (
+          <div dangerouslySetInnerHTML={{ __html: marked.parse(msg.content) }} />
+        ) : (isLoading ? (
           <span class="typing-indicator">
             <span class="typing-dot" />
             <span class="typing-dot" />
@@ -508,8 +516,14 @@ function MessageBlock({ msg, isLast, isLoading }) {
       </div>
 
       {/* Inline artefacts — only for assistant messages */}
-      {!isUser && (hasCharts || hasReport || hasEvidence) && (
+      {!isUser && (hasCharts || hasReport || hasEvidence || hasSlides || hasExport) && (
         <div class="message-artefacts">
+          {/* Inline Download Bar */}
+          <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px; padding-bottom: 8px; border-bottom: 1px solid var(--border-color); flex-wrap: wrap; gap: 8px;">
+            <span style="font-size: 0.8rem; color: var(--text-muted); font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em;">Download Artifact:</span>
+            <DownloadBar reportHtml={art.reportHtml} slides={art.slides} exportData={art.exportData} />
+          </div>
+
           {hasCharts && (
             <div class="artefact-section">
               <div class="artefact-section-head">
@@ -527,6 +541,40 @@ function MessageBlock({ msg, isLast, isLoading }) {
                 <span class="badge">Editable</span>
               </div>
               <ReportEditor html={art.reportHtml} onChange={() => {}} />
+            </div>
+          )}
+
+          {hasExport && (
+            <div class="artefact-section">
+              <div class="artefact-section-head">
+                <h3>📋 Export Data</h3>
+                <span class="badge">{(art.exportData.rows || []).length} rows</span>
+              </div>
+              <div class="export-preview-table-wrapper" style="overflow-x: auto; max-height: 250px; border: 1px solid var(--border-color); border-radius: 6px; background: var(--bg-primary); margin-top: 8px;">
+                <table class="export-preview-table" style="width: 100%; border-collapse: collapse; font-size: 0.85rem;">
+                  <thead>
+                    <tr style="background: var(--bg-secondary); border-bottom: 2px solid var(--border-color);">
+                      {(art.exportData.headers || []).map((h, idx) => (
+                        <th key={idx} style="padding: 8px 12px; text-align: left; font-weight: 600; border-right: 1px solid var(--border-color);">{h}</th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {(art.exportData.rows || []).slice(0, 5).map((row, rIdx) => (
+                      <tr key={rIdx} style="border-bottom: 1px solid var(--border-color); background: rIdx % 2 === 0 ? 'transparent' : 'var(--bg-secondary)';">
+                        {row.map((cell, cIdx) => (
+                          <td key={cIdx} style="padding: 8px 12px; border-right: 1px solid var(--border-color);">{cell}</td>
+                        ))}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+              {(art.exportData.rows || []).length > 5 && (
+                <p style="font-size: 0.75rem; color: var(--text-muted); margin-top: 8px; font-style: italic;">
+                  Showing first 5 rows. Use the download buttons above to get the full dataset.
+                </p>
+              )}
             </div>
           )}
 

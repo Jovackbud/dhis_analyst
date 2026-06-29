@@ -1,7 +1,7 @@
-"""Content generation node — mode-selective, LLM-assisted when available.
+"""Content generation node — mode-selective, LLM-powered.
 
-Only generates content for the active output_mode. Uses LLM for narrative
-generation when a real provider is configured; deterministic rendering otherwise.
+Only generates content for the active output_mode. All narrative generation
+requires a configured LLM provider.
 """
 from __future__ import annotations
 
@@ -9,9 +9,7 @@ import logging
 
 from backend.config import Settings
 from backend.app.agent.renderers.dashboard import render_dashboard
-from backend.app.agent.renderers.report import render_report
 from backend.app.agent.renderers.presentation import render_presentation
-from backend.app.agent.renderers.conversational import render_answer
 from backend.app.agent.state import AgentState
 
 logger = logging.getLogger("dhis2_analyst.generate_content")
@@ -59,14 +57,8 @@ async def generate_content(state: AgentState, settings: Settings) -> AgentState:
 
 
 async def _generate_report(state: AgentState, settings: Settings) -> str:
-    """Generate report HTML — LLM-assisted when available, deterministic fallback."""
-    if settings.use_real_llm:
-        try:
-            return await _llm_report(state, settings)
-        except Exception as exc:
-            logger.warning("llm_report_fallback", extra={"error": str(exc)})
-
-    return render_report(state)
+    """Generate report HTML using the LLM."""
+    return await _llm_report(state, settings)
 
 
 async def _llm_report(state: AgentState, settings: Settings) -> str:
@@ -117,14 +109,8 @@ Use semantic HTML. Tables should use <thead> and <tbody>."""
 
 
 async def _generate_conversational_response(state: AgentState, settings: Settings) -> str:
-    """Generate conversational response — LLM-assisted when available, deterministic fallback."""
-    if settings.use_real_llm:
-        try:
-            return await _llm_conversational(state, settings)
-        except Exception as exc:
-            logger.warning("llm_conversational_fallback", extra={"error": str(exc)})
-
-    return render_answer(state)
+    """Generate conversational response using the LLM."""
+    return await _llm_conversational(state, settings)
 
 
 async def _llm_conversational(state: AgentState, settings: Settings) -> str:

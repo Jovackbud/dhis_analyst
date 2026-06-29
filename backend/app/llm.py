@@ -1,13 +1,11 @@
 """LiteLLM-backed LLM adapter.
 
-Routes all requests through litellm.acompletion(). The ``mock`` provider is
-a deterministic local fallback used only when no API key is available — it is
-not the default production mode.  Set LLM_PROVIDER=openai|anthropic|ollama|azure
-and the matching LLM_API_KEY / LLM_BASE_URL to use a real model.
+Routes all requests through litellm.acompletion(). Requires a configured
+LLM provider (openai, anthropic, ollama, azure, etc.) and appropriate
+credentials (LLM_API_KEY or LLM_BASE_URL).
 """
 from __future__ import annotations
 
-import json
 import logging
 import time
 from typing import Any
@@ -38,12 +36,8 @@ async def complete(
     Raises:
         RuntimeError: If the LLM call fails and provider is not mock.
     """
-    if settings.llm_provider == "mock":
-        logger.debug("llm_mock_mode")
-        return _mock_complete(messages)
-
     try:
-        import litellm  # lazy import — not needed if provider=mock
+        import litellm
 
         model = _resolve_model(settings)
         kwargs: dict[str, Any] = {
@@ -151,39 +145,3 @@ def _resolve_model(settings: Settings) -> str:
     return model
 
 
-def _mock_complete(messages: list[dict[str, str]]) -> str:
-    """Deterministic local fallback for provider=mock. Returns structured JSON
-    for intent classification prompts, plain text otherwise."""
-    last_user = next(
-        (m["content"] for m in reversed(messages) if m["role"] == "user"), ""
-    )
-    system = next(
-        (m["content"] for m in messages if m["role"] == "system"), ""
-    )
-
-    # If this looks like an intent classification request, return minimal valid JSON
-    if "json" in system.lower() and "output_mode" in system.lower():
-        lowered = last_user.lower()
-        mode = "conversational"
-        if any(w in lowered for w in ("slide", "presentation", "deck", "briefing")):
-            mode = "presentation"
-        elif any(w in lowered for w in ("report", "programme review")):
-            mode = "report"
-        elif any(w in lowered for w in ("excel", "csv", "export", "raw numbers")):
-            mode = "export"
-        elif any(w in lowered for w in ("trend", "chart", "dashboard", "compare")):
-            mode = "dashboard"
-
-        return json.dumps({
-            "output_mode": mode,
-            "needs_web_enrichment": any(
-                w in lowered for w in ("who", "guideline", "benchmark", "outbreak", "target")
-            ),
-            "clarification_needed": False,
-            "clarification_question": None,
-        })
-
-    return (
-        f"This is a mock response to assist with public health data analysis. "
-        f"Query: {last_user[:300]}"
-    )

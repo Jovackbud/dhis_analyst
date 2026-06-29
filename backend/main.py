@@ -234,8 +234,6 @@ async def current_identity(
                 dhis2_identity = await validate_dhis2_token(token, settings)
                 if dhis2_identity:
                     return dhis2_identity
-    if settings.llm_provider == "mock":
-        return Identity(user_id="anonymous", role="external_stakeholder")
     raise HTTPException(status_code=401, detail="Authentication required")
 
 
@@ -250,7 +248,6 @@ async def health(settings: Settings = Depends(get_settings)) -> dict:
         "deployment_mode": settings.deployment_mode,
         "evidence_fusion": settings.evidence_fusion,
         "llm_provider": settings.llm_provider,
-        "use_real_llm": settings.use_real_llm,
     }
 
 
